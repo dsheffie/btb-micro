@@ -1,5 +1,7 @@
 #include <cstdio>
 #include <cstdint>
+#include <ostream>
+#include <fstream>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -7,6 +9,7 @@
 #include <cstdlib>
 #include <vector>
 #include <map>
+#include <string>
 
 template <typename T> void swap(T &a, T &b) {
   T t = a;
@@ -27,40 +30,40 @@ static inline uint64_t rdtsc() {
   return ( (uint64_t)lo)|( ((uint64_t)hi)<<32 );
 }
 
-uint8_t *gen_code(int len) {
+uint8_t *gen_code(int len, size_t &sz) {
   using namespace std;
   uint8_t *rawb = NULL;
-  size_t pgsz = 4*getpagesize();
+  size_t pgsz = getpagesize();
   vector<int> targets(len);
-  vector<pair<int,int>> arr(len);
-  map<int,int> labels;
+  map<int,int> next, labels;
   int pos = 0;
   for(int i = 0; i < len; i++) {
     targets.at(i) = i;
   }
   shuffle(targets);
   for(int i = 0; i < len; i++) {
-    arr.at(i).first = targets.at(i);
-    arr.at(i).second = targets.at((i+1)%len);
+    next[targets.at(i)] = targets.at((i+1)%len);
   }
+  sz  = (len-1)*5 + 17;
+  sz = ((sz + pgsz - 1) / pgsz) * pgsz;
   //(len-1)*5 bytes for jump with 32b disp
-  //decq %rdi
-  //jne with 32b disp
-  //mov immediate
-  //retq
+  //decq %rdi -> 3
+  //jne with 32b disp -> 6
+  //mov immediate -> 7
+  //retq -> 1 
   rawb = (uint8_t*)(mmap(NULL,
-			 pgsz,
+			 sz,
 			 PROT_READ|PROT_WRITE|PROT_EXEC,
 			 MAP_ANON|MAP_PRIVATE,
 			 -1,
 			 0));
   assert((uint8_t*)(-1) != rawb);
 
-  rawb[pos++] = 0xcc;
+  //rawb[pos++] = 0xcc;
 
-  
   for(int i = 0; i < len; i++) {
-    labels[arr.at(i).first] = pos;
+    /* emit code for label i */
+    labels[i] = pos;
     if(i != (len-1)) {
       rawb[pos++] = 0xe9;      
       pos += 4;
@@ -85,19 +88,16 @@ uint8_t *gen_code(int len) {
       rawb[pos++] = ll[3];
       //c3                   	retq
       rawb[pos++] = 0xc3;
-    }
+    }    
   }
+  assert(pos < sz);
   
   for(int i = 0; i < len; i++) {
     if(i != (len-1)) {
-      int loc = labels.at(arr.at(i).first);
-      int targ = labels.at(arr.at(i).second);
+      /* label i */
+      int loc = labels.at(i);
+      int targ = labels.at(next.at(i));
       int delta = targ - (loc + 5);
-      printf("%d (pos %d) -> %d (pos %d)\n",
-	     arr.at(i).first,
-	     loc,
-	     arr.at(i).second,
-	     targ);
       loc += 1;
       uint8_t *d = reinterpret_cast<uint8_t*>(&delta);
       rawb[loc++] = d[0];
@@ -107,16 +107,9 @@ uint8_t *gen_code(int len) {
     }
     else {
       /* skip decq */
-      int loc = labels.at(arr.at(i).first) + 3;
-      int targ = labels.at(arr.at(i).second);
+      int loc = labels.at(i) + 3;
+      int targ = labels.at(next.at(i));
       int delta = targ - (loc + 6);
-      printf("%d (pos %d) -> %d (pos %d), disp = %d\n",
-	     arr.at(i).first,
-	     loc,
-	     arr.at(i).second,
-	     targ,
-	     delta
-	     );
       loc += 2;
       uint8_t *d = reinterpret_cast<uint8_t*>(&delta);
       rawb[loc++] = d[0];
@@ -128,56 +121,28 @@ uint8_t *gen_code(int len) {
   return rawb;
 }
 
-extern "C" {
-  int goto_test4(int);
-  int goto_test8(int);
-  int goto_test16(int);
-  int goto_test32(int);
-  int goto_test64(int);
-  int goto_test128(int);
-  int goto_test256(int);
-  int goto_test512(int);
-  int goto_test1024(int);
-  int goto_test2048(int);
-  int goto_test4096(int);
-  int goto_test8192(int);
-  int goto_test16384(int);
-};
-
 typedef int (*test_t)(int);
-static test_t funcs[] = {goto_test4,
-			 goto_test8,
-			 goto_test16,
-			 goto_test32,
-			 goto_test64,
-			 goto_test128,
-			 goto_test256,
-			 goto_test512,
-			 goto_test1024,
-			 goto_test2048,
-			 goto_test4096,
-			 goto_test8192,
-			 goto_test16384
-};
 
 int main() {
-  const size_t n_tests = sizeof(funcs)/sizeof(funcs[0]);
+  char hostname[256] = {0};
   const int64_t n_iters = 1<<20;
   srand(2);
-  test_t t4 = reinterpret_cast<test_t>(gen_code(16));
-  t4(2);
-  return 0;
+  gethostname(hostname,sizeof(hostname));
+  const std::string out_name = std::string(hostname) + std::string(".csv");
+  std::ofstream out(out_name.c_str());
   
-  for(size_t i = 0; i < n_tests; ++i) {
+  for(size_t i = 2; i < 16; ++i) {
+    size_t code_sz = 0;
+    test_t t4 = reinterpret_cast<test_t>(gen_code(1<<i, code_sz));
     uint64_t now = rdtsc();
-    int sz = funcs[i](n_iters);
+    int sz = t4(n_iters);
     now = rdtsc() - now;
     int64_t jumps = n_iters * sz;
-    printf("now = %lu\n", now);
-    //printf("now = %u, jumps = %d\n", now, n_iters*sz);
-    
     double cycles_per_j =  ((double)now) / jumps;
     printf("sz = %d, cycles per jump = %g\n", sz, cycles_per_j);
+    out << sz << "," << cycles_per_j << "\n";
+    munmap(reinterpret_cast<void*>(t4), code_sz);
   }
+  out.close();
   return 0;
 }
